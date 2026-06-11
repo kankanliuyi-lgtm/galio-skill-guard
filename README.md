@@ -4,6 +4,8 @@
 
 > 先扫描，再安装。扫描未发现问题，不代表绝对安全。
 
+![加里奥 Skill：安装 Agent Skill 前的安全扫描守卫](assets/galio-skill-guard-cover.png)
+
 技术名称：`galio-skill-guard`
 
 当前版本：`v0.2.0-alpha`
