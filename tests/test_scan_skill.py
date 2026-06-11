@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -51,6 +52,55 @@ class SkillScannerTests(unittest.TestCase):
             "]",
         ])
         self.assertEqual(SCAN.scan_text("scanner.py", text), [])
+
+    def test_package_dependencies_and_install_script_are_reported(self) -> None:
+        package = json.dumps({
+            "scripts": {"postinstall": "node setup.js"},
+            "dependencies": {"fixed": "1.2.3", "floating": "^2.0.0"},
+        })
+        dependencies, findings = SCAN.dependency_findings([("package.json", package)])
+        self.assertEqual(len(dependencies), 2)
+        self.assertEqual(
+            {item.name: item.pinned for item in dependencies},
+            {"fixed": True, "floating": False},
+        )
+        self.assertTrue({"SUP001", "DEP001"} <= {item.rule_id for item in findings})
+
+    def test_baseline_reports_new_file_and_finding(self) -> None:
+        baseline = {"files": {"SKILL.md": "old"}, "findings": []}
+        finding = SCAN.Finding(
+            "CMD001", "代码执行", "critical", "setup.sh", 1,
+            "curl example | bash", "danger", "remove",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            changes = SCAN.write_change_report(
+                output, baseline,
+                {"SKILL.md": "new", "setup.sh": "hash"},
+                [finding],
+            )
+            report = (output / "change-report.md").read_text(encoding="utf-8")
+        self.assertEqual(changes["added_files"], ["setup.sh"])
+        self.assertEqual(changes["changed_files"], ["SKILL.md"])
+        self.assertIn("CMD001", report)
+
+    def test_github_url_parser_supports_skill_subpath(self) -> None:
+        owner, repo, ref, subpath = SCAN.parse_github_url(
+            "https://github.com/example/skills/tree/main/skills/demo"
+        )
+        self.assertEqual((owner, repo, ref, subpath), (
+            "example", "skills", "main", "skills/demo",
+        ))
+
+    def test_repeated_same_rule_does_not_inflate_score(self) -> None:
+        findings = [
+            SCAN.Finding("CMD004", "代码执行", "medium", f"file-{index}.py", 1,
+                         "subprocess.run", "process", "review")
+            for index in range(10)
+        ]
+        level, _, score = SCAN.risk_result(findings)
+        self.assertEqual(level, "中风险")
+        self.assertEqual(score, 3)
 
 
 if __name__ == "__main__":

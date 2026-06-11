@@ -17,6 +17,8 @@
 - Persistence through shell profiles, scheduled tasks, or Agent configuration.
 - Obfuscation and encoded payloads.
 - ZIP path traversal and symbolic links.
+- Unpinned dependencies and package installation lifecycle scripts.
+- New files and newly introduced findings compared with a prior scan.
 - Unverified official/brand claims and suspicious domains.
 
 ## Known limitations
@@ -25,4 +27,5 @@
 - Regex rules can produce false positives and false negatives.
 - The scanner does not establish legal ownership of a brand.
 - The scanner does not query package registries, DNS, WHOIS, or malware feeds in the MVP.
+- GitHub API rate limits may reduce available repository metadata; commit SHA remains pinned.
 - Native binaries require separate signature and sandbox analysis.

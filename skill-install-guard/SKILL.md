@@ -18,14 +18,23 @@ Scan first, explain second, install only after the user makes the decision. Trea
 
 ## Workflow
 
-1. Locate the input: local directory, ZIP, standalone `SKILL.md`, or another text file.
-2. For a GitHub URL, obtain a local read-only copy without running repository code.
+1. Locate the input: public GitHub URL, local directory, ZIP, standalone `SKILL.md`, or another text file.
+2. For a GitHub URL, let the scanner resolve a commit SHA and inspect the Codeload ZIP without checkout.
 3. Run the deterministic scanner:
 
 ```bash
 python3 scripts/scan_skill.py \
-  --input path/to/untrusted-skill \
+  --input https://github.com/owner/repository \
   --output-dir outputs/skill-security-review
+```
+
+For an update comparison:
+
+```bash
+python3 scripts/scan_skill.py \
+  --input https://github.com/owner/repository \
+  --baseline previous-review/findings.json \
+  --output-dir outputs/new-review
 ```
 
 4. Read reports in this order:
@@ -33,6 +42,8 @@ python3 scripts/scan_skill.py \
    - `provenance-report.md`
    - `permission-report.md`
    - `code-risk-report.md`
+   - `dependency-report.md`
+   - `change-report.md`
 5. Inspect the original context around every critical or high finding.
 6. Explain false-positive possibilities and unresolved unknowns.
 7. Ask the user to decide whether to reject, investigate, or install. Never silently continue to installation.
@@ -50,6 +61,8 @@ python3 scripts/scan_skill.py \
 - `provenance-report.md`: domains, official claims, and source-verification checklist.
 - `permission-report.md`: sensitive data, network, filesystem, and persistence behaviors.
 - `code-risk-report.md`: code and instruction findings plus file SHA-256 hashes.
+- `dependency-report.md`: dependency versions, lifecycle scripts, and supply-chain findings.
+- `change-report.md`: file and risk differences from a previous `findings.json`.
 - `findings.json`: machine-readable result for CI or future integrations.
 
 ## Review guidance

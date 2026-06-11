@@ -5,15 +5,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
+import io
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 TEXT_EXTENSIONS = {
@@ -23,6 +28,7 @@ TEXT_EXTENSIONS = {
     ".css", ".env", ".lock",
 }
 MAX_TEXT_BYTES = 2_000_000
+MAX_DOWNLOAD_BYTES = 30_000_000
 SEVERITY_SCORE = {"info": 0, "low": 1, "medium": 3, "high": 7, "critical": 15}
 SEVERITY_CN = {
     "info": "提示", "low": "低风险", "medium": "中风险",
@@ -53,6 +59,15 @@ class Finding:
     recommendation: str
 
 
+@dataclass
+class Dependency:
+    ecosystem: str
+    name: str
+    specification: str
+    path: str
+    pinned: bool
+
+
 RULES = [
     Rule("CMD001", "代码执行", "critical", r"\bcurl\b[^\n|]{0,300}\|\s*(?:ba)?sh\b",
          "下载内容被直接交给 Shell 执行。", "下载后先校验哈希并人工审查，禁止管道直执行。"),
@@ -60,8 +75,10 @@ RULES = [
          "下载内容被直接交给 Shell 执行。", "下载后先校验哈希并人工审查，禁止管道直执行。"),
     Rule("CMD003", "代码执行", "high", r"\b(?:eval|exec)\s*\(",
          "发现动态代码执行。", "移除动态执行，改用明确、可审计的调用。"),
-    Rule("CMD004", "代码执行", "high", r"(?:subprocess\.(?:run|Popen|call)|os\.system)\s*\(",
-         "脚本可以执行系统命令。", "逐条审查命令、参数来源和用户确认流程。"),
+    Rule("CMD004", "代码执行", "medium", r"subprocess\.(?:run|Popen|call)\s*\(",
+         "脚本可以启动受控子进程。", "逐条审查固定命令、参数来源、超时和用户确认流程。"),
+    Rule("CMD005", "代码执行", "high", r"(?:os\.system\s*\(|shell\s*=\s*True)",
+         "发现通过 Shell 执行命令的高风险方式。", "移除 shell=True/os.system，改用参数数组和固定命令。"),
     Rule("DEL001", "破坏性操作", "critical", r"\brm\s+(?:-[^\n ]*r[^\n ]*f|-[^\n ]*f[^\n ]*r)\b",
          "发现递归强制删除命令。", "阻止安装，除非删除范围被严格限定且得到用户确认。"),
     Rule("DEL002", "破坏性操作", "critical", r"\b(?:diskutil\s+erase|mkfs(?:\.\w+)?|format\s+[a-z]:)",
@@ -168,49 +185,216 @@ def collect_directory(root: Path) -> tuple[list[tuple[str, bytes]], list[Finding
 
 
 def collect_zip(path: Path) -> tuple[list[tuple[str, bytes]], list[Finding]]:
+    with zipfile.ZipFile(path) as archive:
+        return collect_zip_archive(archive, strip_root=False)
+
+
+def collect_zip_archive(
+    archive: zipfile.ZipFile,
+    prefix: str | None = None,
+    strip_root: bool = True,
+) -> tuple[list[tuple[str, bytes]], list[Finding]]:
     files = []
     findings = []
-    with zipfile.ZipFile(path) as archive:
-        for info in archive.infolist():
-            name = info.filename
-            normalized = PurePosixPath(name)
-            if normalized.is_absolute() or ".." in normalized.parts:
+    for info in archive.infolist():
+        name = info.filename
+        normalized = PurePosixPath(name)
+        if normalized.is_absolute() or ".." in normalized.parts:
+            findings.append(structural(
+                "ZIP001", "压缩包", "critical", name, name,
+                "ZIP 包含路径穿越条目。", "阻止安装，不要解压该压缩包。",
+            ))
+            continue
+        unix_mode = info.external_attr >> 16
+        if stat.S_ISLNK(unix_mode):
+            findings.append(structural(
+                "ZIP002", "压缩包", "high", name, "symbolic link",
+                "ZIP 包含符号链接。", "确认链接目标不会越过 Skill 根目录。",
+            ))
+            continue
+        if info.is_dir():
+            continue
+        relative = strip_archive_root(name) if strip_root else name
+        if prefix:
+            normalized_prefix = prefix.strip("/") + "/"
+            if not relative.startswith(normalized_prefix):
+                continue
+            relative = relative[len(normalized_prefix):]
+        if not relative:
+            continue
+        if info.file_size > MAX_TEXT_BYTES:
+            if unix_mode & stat.S_IXUSR:
                 findings.append(structural(
-                    "ZIP001", "压缩包", "critical", name, name,
-                    "ZIP 包含路径穿越条目。", "阻止安装，不要解压该压缩包。",
+                    "ZIP003", "压缩包", "medium", relative, f"{info.file_size} bytes",
+                    "ZIP 包含较大的可执行或未知文件。", "核验来源、签名和哈希。",
                 ))
-                continue
-            unix_mode = info.external_attr >> 16
-            if stat.S_ISLNK(unix_mode):
-                findings.append(structural(
-                    "ZIP002", "压缩包", "high", name, "symbolic link",
-                    "ZIP 包含符号链接。", "确认链接目标不会越过 Skill 根目录。",
-                ))
-                continue
-            if info.is_dir():
-                continue
-            if info.file_size > MAX_TEXT_BYTES:
-                if unix_mode & stat.S_IXUSR:
-                    findings.append(structural(
-                        "ZIP003", "压缩包", "medium", name, f"{info.file_size} bytes",
-                        "ZIP 包含较大的可执行或未知文件。", "核验来源、签名和哈希。",
-                    ))
-                continue
-            if is_text_candidate(name):
-                files.append((name, archive.read(info)))
+            continue
+        if is_text_candidate(relative):
+            files.append((relative, archive.read(info)))
     return files, findings
 
 
-def collect_input(path: Path) -> tuple[list[tuple[str, bytes]], list[Finding], str]:
+def strip_archive_root(name: str) -> str:
+    parts = PurePosixPath(name).parts
+    return PurePosixPath(*parts[1:]).as_posix() if len(parts) > 1 else name
+
+
+def parse_github_url(value: str) -> tuple[str, str, str | None, str | None]:
+    parsed = urlparse(value)
+    if parsed.hostname not in {"github.com", "www.github.com"}:
+        raise ValueError("Only github.com repository URLs are supported")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError("GitHub URL must include owner and repository")
+    owner, repo = parts[0], re.sub(r"\.git$", "", parts[1])
+    ref = None
+    subpath = None
+    if len(parts) >= 4 and parts[2] in {"tree", "blob"}:
+        ref = parts[3]
+        subpath = "/".join(parts[4:]) or None
+        if parts[2] == "blob" and subpath:
+            subpath = str(PurePosixPath(subpath).parent)
+    return owner, repo, ref, subpath
+
+
+def http_get(url: str, accept_json: bool = False) -> bytes:
+    headers = {"User-Agent": "skill-install-guard/0.2"}
+    if accept_json:
+        headers["Accept"] = "application/vnd.github+json"
+    last_error = None
+    for _ in range(2):
+        try:
+            request = Request(url, headers=headers)
+            with urlopen(request, timeout=30) as response:
+                length = response.headers.get("Content-Length")
+                if length and int(length) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"Remote content exceeds {MAX_DOWNLOAD_BYTES} bytes")
+                data = response.read(MAX_DOWNLOAD_BYTES + 1)
+            if len(data) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"Remote content exceeds {MAX_DOWNLOAD_BYTES} bytes")
+            return data
+        except http.client.IncompleteRead as exc:
+            last_error = exc
+    try:
+        result = subprocess.run(
+            [
+                "curl", "-L", "--fail", "--silent", "--show-error",
+                "--retry", "2", "--max-filesize", str(MAX_DOWNLOAD_BYTES), url,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"Incomplete remote download after retry: {last_error}") from exc
+    if len(result.stdout) > MAX_DOWNLOAD_BYTES:
+        raise ValueError(f"Remote content exceeds {MAX_DOWNLOAD_BYTES} bytes")
+    return result.stdout
+
+
+def resolve_github_head(owner: str, repo: str) -> tuple[str, str]:
+    url = f"https://github.com/{owner}/{repo}.git"
+    result = subprocess.run(
+        ["git", "ls-remote", "--symref", url, "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    branch = "HEAD"
+    sha = ""
+    for line in result.stdout.splitlines():
+        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+            branch = line.split("refs/heads/", 1)[1].split("\t", 1)[0]
+        elif line.endswith("\tHEAD"):
+            sha = line.split("\t", 1)[0]
+    if not sha:
+        raise ValueError("Unable to resolve GitHub repository HEAD")
+    return branch, sha
+
+
+def collect_github(value: str) -> tuple[
+    list[tuple[str, bytes]], list[Finding], str, dict[str, object]
+]:
+    owner, repo, ref, subpath = parse_github_url(value)
+    api_url = f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}"
+    api_status = "available"
+    try:
+        metadata = json.loads(http_get(api_url, accept_json=True).decode("utf-8"))
+        resolved_ref = ref or metadata.get("default_branch") or "main"
+        commit_url = (
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/"
+            f"commits/{quote(str(resolved_ref), safe='')}"
+        )
+        commit = json.loads(http_get(commit_url, accept_json=True).decode("utf-8"))
+        sha = commit.get("sha")
+    except (HTTPError, URLError, json.JSONDecodeError):
+        metadata = {
+            "html_url": f"https://github.com/{owner}/{repo}",
+            "owner": {},
+        }
+        api_status = "unavailable; used git ls-remote fallback"
+        if ref:
+            result = subprocess.run(
+                ["git", "ls-remote", f"https://github.com/{owner}/{repo}.git", ref],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            sha = result.stdout.split("\t", 1)[0].strip()
+            resolved_ref = ref
+            if not sha:
+                raise ValueError(f"Unable to resolve GitHub ref: {ref}")
+        else:
+            resolved_ref, sha = resolve_github_head(owner, repo)
+    archive_url = f"https://codeload.github.com/{quote(owner)}/{quote(repo)}/zip/{quote(str(sha), safe='')}"
+    archive_data = http_get(archive_url)
+    with zipfile.ZipFile(io.BytesIO(archive_data)) as archive:
+        files, findings = collect_zip_archive(archive, subpath)
+    source_metadata = {
+        "provider": "github",
+        "metadata_api": api_status,
+        "repository": f"{owner}/{repo}",
+        "html_url": metadata.get("html_url"),
+        "owner_type": (metadata.get("owner") or {}).get("type"),
+        "default_branch": metadata.get("default_branch"),
+        "requested_ref": ref,
+        "resolved_sha": sha,
+        "subpath": subpath,
+        "created_at": metadata.get("created_at"),
+        "updated_at": metadata.get("updated_at"),
+        "pushed_at": metadata.get("pushed_at"),
+        "archived": metadata.get("archived"),
+        "fork": metadata.get("fork"),
+        "visibility": metadata.get("visibility"),
+        "stars": metadata.get("stargazers_count"),
+        "download_sha256": sha256(archive_data),
+    }
+    if metadata.get("archived"):
+        findings.append(structural(
+            "PROV004", "来源真实性", "medium", "(repository)", "archived repository",
+            "GitHub 仓库已归档，后续安全修复可能不再维护。",
+            "确认是否有活跃的上游仓库或维护者说明。",
+        ))
+    return files, findings, "github", source_metadata
+
+
+def collect_input(value: str) -> tuple[
+    list[tuple[str, bytes]], list[Finding], str, dict[str, object]
+]:
+    if value.startswith(("https://github.com/", "http://github.com/")):
+        return collect_github(value)
+    path = Path(value).expanduser().resolve()
     if not path.exists():
         raise ValueError(f"Input not found: {path}")
     if path.is_dir():
         files, findings = collect_directory(path)
-        return files, findings, "directory"
+        return files, findings, "directory", {}
     if path.suffix.lower() == ".zip":
         files, findings = collect_zip(path)
-        return files, findings, "zip"
-    return [(path.name, path.read_bytes())], [], "file"
+        return files, findings, "zip", {}
+    return [(path.name, path.read_bytes())], [], "file", {}
 
 
 def compact_evidence(line: str) -> str:
@@ -278,6 +462,8 @@ def provenance_findings(texts: list[tuple[str, str]]) -> tuple[list[Finding], li
                 ))
     domains = sorted({urlparse(url).hostname or "" for url in urls if urlparse(url).hostname})
     for domain in domains:
+        if domain in {"github.com", "api.github.com", "codeload.github.com"}:
+            continue
         if re.search(r"(?:cdn|api|download|official|service)[-.]", domain, re.I) and domain.count(".") >= 2:
             findings.append(structural(
                 "PROV002", "来源真实性", "medium", "(URLs)", domain,
@@ -285,6 +471,82 @@ def provenance_findings(texts: list[tuple[str, str]]) -> tuple[list[Finding], li
                 "检查 DNS、证书和品牌官网是否链接到该域名。",
             ))
     return findings, domains
+
+
+def is_pinned(specification: str) -> bool:
+    spec = specification.strip()
+    if not spec or spec in {"*", "latest"}:
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?", spec):
+        return True
+    if re.search(r"(?:^|[^<>!~])==\s*[A-Za-z0-9]", spec):
+        return True
+    if re.fullmatch(r"[A-Fa-f0-9]{40,64}", spec):
+        return True
+    return False
+
+
+def dependency_findings(texts: list[tuple[str, str]]) -> tuple[list[Dependency], list[Finding]]:
+    dependencies = []
+    findings = []
+    for path, text in texts:
+        name = PurePosixPath(path).name.lower()
+        if name == "package.json":
+            try:
+                package = json.loads(text)
+            except json.JSONDecodeError:
+                findings.append(structural(
+                    "SUP003", "供应链", "medium", path, "invalid JSON",
+                    "无法解析 package.json。", "修复清单格式并人工检查安装脚本。",
+                ))
+                continue
+            scripts = package.get("scripts") or {}
+            for script_name in ("preinstall", "install", "postinstall", "prepare"):
+                if script_name in scripts:
+                    findings.append(Finding(
+                        "SUP001", "供应链", "high", path, 1,
+                        f"{script_name}: {scripts[script_name]}",
+                        "发现安装生命周期脚本。",
+                        "人工审查脚本，首次安装时考虑使用 --ignore-scripts。",
+                    ))
+            for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                for dep_name, spec in (package.get(section) or {}).items():
+                    spec_text = str(spec)
+                    pinned = is_pinned(spec_text)
+                    dependencies.append(Dependency("npm", dep_name, spec_text, path, pinned))
+                    if not pinned:
+                        findings.append(Finding(
+                            "DEP001", "供应链", "medium", path, 1,
+                            f"{dep_name}: {spec_text}",
+                            "npm 依赖未固定到精确版本或提交。",
+                            "使用 lockfile，并核对解析后的完整版本与完整性哈希。",
+                        ))
+        elif name in {"requirements.txt", "requirements-dev.txt"}:
+            for number, raw in enumerate(text.splitlines(), start=1):
+                line = raw.strip()
+                if not line or line.startswith(("#", "-", "--")):
+                    continue
+                match = re.match(r"([A-Za-z0-9_.-]+)\s*(.*)", line)
+                if not match:
+                    continue
+                dep_name, spec = match.groups()
+                pinned = bool(re.match(r"\s*==\s*[^*]+$", spec))
+                dependencies.append(Dependency("pypi", dep_name, spec.strip() or "*", path, pinned))
+                if not pinned:
+                    findings.append(Finding(
+                        "DEP002", "供应链", "medium", path, number, line,
+                        "Python 依赖未固定到精确版本。",
+                        "固定版本并使用带哈希的 requirements lock 文件。",
+                    ))
+        elif name == "pyproject.toml":
+            for number, raw in enumerate(text.splitlines(), start=1):
+                match = re.search(r'["\']([A-Za-z0-9_.-]+)([^"\']*)["\']', raw)
+                if match and any(token in raw for token in ("dependencies", "requires", " = ")):
+                    dep_name, spec = match.groups()
+                    dependencies.append(
+                        Dependency("pypi/pyproject", dep_name, spec.strip() or "*", path, is_pinned(spec))
+                    )
+    return dependencies, findings
 
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
@@ -299,12 +561,18 @@ def deduplicate(findings: list[Finding]) -> list[Finding]:
 
 
 def risk_result(findings: list[Finding]) -> tuple[str, str, int]:
-    score = sum(SEVERITY_SCORE[item.severity] for item in findings)
+    rule_scores: dict[str, int] = {}
+    for item in findings:
+        rule_scores[item.rule_id] = max(
+            rule_scores.get(item.rule_id, 0),
+            SEVERITY_SCORE[item.severity],
+        )
+    score = sum(rule_scores.values())
     if any(item.severity == "critical" for item in findings) or score >= 25:
         return "阻止安装", "发现严重风险或高风险组合，建议不要安装。", score
     if any(item.severity == "high" for item in findings) or score >= 12:
         return "高风险", "暂缓安装，必须逐项人工复核。", score
-    if score >= 4:
+    if any(item.severity == "medium" for item in findings) or score >= 4:
         return "中风险", "存在需要解释的权限或行为，确认后再安装。", score
     return "低风险", "未发现明显高危行为，但不代表绝对安全。", score
 
@@ -326,9 +594,117 @@ def markdown_table(findings: list[Finding]) -> list[str]:
     return lines
 
 
-def write_reports(output: Path, source: Path, source_type: str,
+def finding_identity(item: Finding | dict[str, object]) -> str:
+    if isinstance(item, Finding):
+        return f"{item.rule_id}|{item.path}|{item.evidence}"
+    return f"{item.get('rule_id')}|{item.get('path')}|{item.get('evidence')}"
+
+
+def load_baseline(path: str | None) -> dict[str, object] | None:
+    if not path:
+        return None
+    baseline_path = Path(path).expanduser()
+    with baseline_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict) or "files" not in data or "findings" not in data:
+        raise ValueError("Baseline must be a findings.json generated by this scanner")
+    return data
+
+
+def write_change_report(
+    output: Path,
+    baseline: dict[str, object] | None,
+    file_hashes: dict[str, str],
+    findings: list[Finding],
+) -> dict[str, object]:
+    if baseline is None:
+        result = {"baseline_used": False}
+        lines = [
+            "# 版本变化报告", "",
+            "本次没有提供基线报告。后续可使用：",
+            "",
+            "```bash",
+            "--baseline path/to/previous/findings.json",
+            "```",
+            "",
+        ]
+    else:
+        old_files = baseline.get("files") or {}
+        old_findings = baseline.get("findings") or []
+        if not isinstance(old_files, dict) or not isinstance(old_findings, list):
+            raise ValueError("Invalid baseline structure")
+        added = sorted(set(file_hashes) - set(old_files))
+        removed = sorted(set(old_files) - set(file_hashes))
+        changed = sorted(
+            path for path in set(file_hashes) & set(old_files)
+            if file_hashes[path] != old_files[path]
+        )
+        old_ids = {finding_identity(item) for item in old_findings if isinstance(item, dict)}
+        new_ids = {finding_identity(item) for item in findings}
+        introduced = [item for item in findings if finding_identity(item) not in old_ids]
+        resolved = sorted(old_ids - new_ids)
+        result = {
+            "baseline_used": True,
+            "added_files": added,
+            "removed_files": removed,
+            "changed_files": changed,
+            "introduced_findings": [asdict(item) for item in introduced],
+            "resolved_finding_ids": resolved,
+        }
+        lines = [
+            "# 版本变化报告", "",
+            f"- 新增文件：{len(added)}",
+            f"- 删除文件：{len(removed)}",
+            f"- 内容变化：{len(changed)}",
+            f"- 新增风险：{len(introduced)}",
+            f"- 已消失风险：{len(resolved)}",
+            "",
+            "## 新增或变化文件", "",
+        ]
+        lines += [f"- 新增：`{path}`" for path in added]
+        lines += [f"- 变化：`{path}`" for path in changed]
+        lines += [f"- 删除：`{path}`" for path in removed]
+        if not added and not changed and not removed:
+            lines.append("- 文件哈希没有变化。")
+        lines += ["", "## 新增风险", ""]
+        lines += markdown_table(introduced)
+    (output / "change-report.md").write_text("\n".join(lines), encoding="utf-8")
+    return result
+
+
+def write_dependency_report(
+    output: Path,
+    dependencies: list[Dependency],
+    findings: list[Finding],
+) -> None:
+    supply_findings = [item for item in findings if item.category == "供应链"]
+    lines = [
+        "# 依赖与供应链报告", "",
+        f"- 识别依赖：{len(dependencies)}",
+        f"- 未固定依赖：{sum(not item.pinned for item in dependencies)}",
+        "", "## 依赖清单", "",
+        "| 生态 | 名称 | 版本/来源 | 已固定 | 文件 |",
+        "|---|---|---|---|---|",
+    ]
+    if dependencies:
+        for item in dependencies:
+            spec = item.specification.replace("|", "\\|")
+            lines.append(
+                f"| {item.ecosystem} | `{item.name}` | `{spec}` | "
+                f"{'是' if item.pinned else '否'} | `{item.path}` |"
+            )
+    else:
+        lines.append("| - | 未识别到依赖清单 | - | - | - |")
+    lines += ["", "## 供应链风险", ""]
+    lines += markdown_table(supply_findings)
+    (output / "dependency-report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_reports(output: Path, source: str, source_type: str,
                   file_hashes: dict[str, str], findings: list[Finding],
-                  domains: list[str]) -> None:
+                  domains: list[str], dependencies: list[Dependency],
+                  source_metadata: dict[str, object],
+                  baseline: dict[str, object] | None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     level, recommendation, score = risk_result(findings)
     counts = {severity: 0 for severity in SEVERITY_SCORE}
@@ -359,7 +735,16 @@ def write_reports(output: Path, source: Path, source_type: str,
     (output / "security-summary.md").write_text("\n".join(summary), encoding="utf-8")
 
     provenance = [item for item in findings if item.category == "来源真实性"]
-    lines = ["# 来源真实性报告", "", "## 外部域名", ""]
+    lines = ["# 来源真实性报告", "", "## 来源元数据", ""]
+    if source_metadata:
+        lines += [
+            f"- {key}：`{value}`"
+            for key, value in source_metadata.items()
+            if value is not None
+        ]
+    else:
+        lines.append("- 本地输入，没有远程仓库元数据。")
+    lines += ["", "## 外部域名", ""]
     lines += [f"- `{domain}`" for domain in domains] or ["- 未发现外部域名。"]
     lines += ["", "## 来源风险", ""] + markdown_table(provenance)
     lines += [
@@ -392,10 +777,15 @@ def write_reports(output: Path, source: Path, source_type: str,
     lines.append("")
     (output / "code-risk-report.md").write_text("\n".join(lines), encoding="utf-8")
 
+    write_dependency_report(output, dependencies, findings)
+    changes = write_change_report(output, baseline, file_hashes, findings)
     payload = {
         "source": str(source), "source_type": source_type,
         "risk_level": level, "recommendation": recommendation, "risk_score": score,
         "files": file_hashes, "domains": domains,
+        "source_metadata": source_metadata,
+        "dependencies": [asdict(item) for item in dependencies],
+        "changes": changes,
         "findings": [asdict(item) for item in findings],
     }
     (output / "findings.json").write_text(
@@ -404,9 +794,10 @@ def write_reports(output: Path, source: Path, source_type: str,
 
 
 def run(args: argparse.Namespace) -> int:
-    source = Path(args.input).expanduser().resolve()
+    source = args.input
     output = Path(args.output_dir).expanduser()
-    raw_files, structural_findings, source_type = collect_input(source)
+    raw_files, structural_findings, source_type, source_metadata = collect_input(source)
+    baseline = load_baseline(args.baseline)
     texts = []
     hashes = {}
     findings = list(structural_findings)
@@ -423,8 +814,12 @@ def run(args: argparse.Namespace) -> int:
         texts.append((path, text))
         findings.extend(scan_text(path, text))
     provenance, domains = provenance_findings(texts)
-    findings = deduplicate(findings + provenance)
-    write_reports(output, source, source_type, hashes, findings, domains)
+    dependencies, dependency_risks = dependency_findings(texts)
+    findings = deduplicate(findings + provenance + dependency_risks)
+    write_reports(
+        output, source, source_type, hashes, findings, domains,
+        dependencies, source_metadata, baseline,
+    )
     level, recommendation, _ = risk_result(findings)
     print(f"{level}: {recommendation}")
     print(output)
@@ -433,14 +828,21 @@ def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="Skill directory, ZIP, or individual file")
+    parser.add_argument(
+        "--input", required=True,
+        help="GitHub URL, Skill directory, ZIP, or individual file",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory for scan reports")
+    parser.add_argument("--baseline", help="Previous findings.json for update comparison")
     return parser
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(run(build_parser().parse_args()))
-    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+    except (
+        OSError, ValueError, zipfile.BadZipFile, HTTPError, URLError,
+        json.JSONDecodeError, subprocess.SubprocessError, http.client.HTTPException,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(3)
