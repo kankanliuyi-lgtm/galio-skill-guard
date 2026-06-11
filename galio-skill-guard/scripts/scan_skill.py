@@ -258,7 +258,7 @@ def parse_github_url(value: str) -> tuple[str, str, str | None, str | None]:
 
 
 def http_get(url: str, accept_json: bool = False) -> bytes:
-    headers = {"User-Agent": "skill-install-guard/0.2"}
+    headers = {"User-Agent": "galio-skill-guard/0.2"}
     if accept_json:
         headers["Accept"] = "application/vnd.github+json"
     last_error = None

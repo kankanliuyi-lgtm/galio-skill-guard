@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "skill-install-guard" / "scripts" / "scan_skill.py"
+SCRIPT = Path(__file__).parents[1] / "galio-skill-guard" / "scripts" / "scan_skill.py"
 SPEC = importlib.util.spec_from_file_location("scan_skill", SCRIPT)
 assert SPEC and SPEC.loader
 SCAN = importlib.util.module_from_spec(SPEC)

@@ -1,8 +1,12 @@
-# Skill Install Guard
+# 加里奥 Skill
 
 安装 Agent Skill 之前，先扫描来源、指令、代码和权限风险。
 
 > 先扫描，再安装。扫描未发现问题，不代表绝对安全。
+
+技术名称：`galio-skill-guard`
+
+当前版本：`v0.2.0-alpha`
 
 ## v0.2 能力
 
@@ -19,7 +23,7 @@
 ## 快速开始
 
 ```bash
-python3 skill-install-guard/scripts/scan_skill.py \
+python3 galio-skill-guard/scripts/scan_skill.py \
   --input https://github.com/owner/repository \
   --output-dir outputs/security-review
 ```
@@ -29,7 +33,7 @@ python3 skill-install-guard/scripts/scan_skill.py \
 扫描本地文件：
 
 ```bash
-python3 skill-install-guard/scripts/scan_skill.py \
+python3 galio-skill-guard/scripts/scan_skill.py \
   --input path/to/untrusted-skill.zip \
   --output-dir outputs/security-review
 ```
@@ -37,7 +41,7 @@ python3 skill-install-guard/scripts/scan_skill.py \
 扫描新版本并和上次结果比较：
 
 ```bash
-python3 skill-install-guard/scripts/scan_skill.py \
+python3 galio-skill-guard/scripts/scan_skill.py \
   --input https://github.com/owner/repository \
   --baseline previous-review/findings.json \
   --output-dir outputs/new-review
@@ -48,21 +52,21 @@ python3 skill-install-guard/scripts/scan_skill.py \
 安装到 Codex：
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/skill-install-guard"
-cp -R skill-install-guard/. "${CODEX_HOME:-$HOME/.codex}/skills/skill-install-guard/"
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/galio-skill-guard"
+cp -R galio-skill-guard/. "${CODEX_HOME:-$HOME/.codex}/skills/galio-skill-guard/"
 ```
 
 安装到 Claude Code：
 
 ```bash
-mkdir -p "$HOME/.claude/skills/skill-install-guard"
-cp -R skill-install-guard/. "$HOME/.claude/skills/skill-install-guard/"
+mkdir -p "$HOME/.claude/skills/galio-skill-guard"
+cp -R galio-skill-guard/. "$HOME/.claude/skills/galio-skill-guard/"
 ```
 
 安装后可以直接说：
 
 ```text
-先用 skill-install-guard 扫描这个 Skill，确认风险后我再决定是否安装。
+先用加里奥 Skill 扫描这个 Skill，确认风险后我再决定是否安装。
 ```
 
 退出码：
@@ -82,6 +86,12 @@ cp -R skill-install-guard/. "$HOME/.claude/skills/skill-install-guard/"
 - `change-report.md`
 - `findings.json`
 
+脱敏报告示例：[examples/security-summary-example.md](examples/security-summary-example.md)
+
+## 安全问题
+
+发现扫描器漏洞或绕过方式时，请阅读 [SECURITY.md](SECURITY.md)。不要在公开 Issue 中粘贴真实 Token、私钥或用户文件。
+
 ## 当前边界
 
 - 不证明 Skill 绝对安全。
@@ -95,7 +105,7 @@ cp -R skill-install-guard/. "$HOME/.claude/skills/skill-install-guard/"
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile skill-install-guard/scripts/scan_skill.py
+python3 -m py_compile galio-skill-guard/scripts/scan_skill.py
 ```
 
 ## License

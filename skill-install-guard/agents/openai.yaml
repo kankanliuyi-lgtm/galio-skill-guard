@@ -1,4 +1,0 @@
-interface:
-  display_name: "Skill Install Guard"
-  short_description: "安装前扫描 Agent Skill 的来源、指令、代码与权限风险"
-  default_prompt: "Use $skill-install-guard to scan this Skill before I install it."
